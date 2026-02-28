@@ -15,7 +15,7 @@
 #include <esb.h>
 #include "esb_comm_driver.h"
 
-#define PLAYER_ID 2     // Change to 1 for PLAYER 1, 2 for PLAYER 2 (different address set)
+#define PLAYER_ID 1     // Change to 1 for PLAYER 1, 2 for PLAYER 2 (different address set)
 
 LOG_MODULE_REGISTER(esb_comm, LOG_LEVEL_ERR);
 

@@ -5,6 +5,7 @@
 
 #include "display.h"
 #include "ui_Images.h"
+#include <string.h>
 
 LOG_MODULE_REGISTER(display_lib, LOG_LEVEL_ERR);
 
@@ -69,76 +70,61 @@ void display_set_pixel(int16_t x, int16_t y, bool on)
  */
 void display_draw_letter(char letter, int16_t x, int16_t y)
 {
-    switch (letter) {
-        case 'R':
-        case 'r':
-            // Draw "R" - original design, coordinates will be rotated by display_set_pixel
-            // Vertical line
-            for (int i = 0; i < 12; i++) {
-                display_set_pixel(x, y + i, true);
+    static const uint8_t GLYPH_A[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11};
+    static const uint8_t GLYPH_C[7] = {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E};
+    static const uint8_t GLYPH_E[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F};
+    static const uint8_t GLYPH_L[7] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
+    static const uint8_t GLYPH_M[7] = {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11};
+    static const uint8_t GLYPH_N[7] = {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11};
+    static const uint8_t GLYPH_O[7] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+    static const uint8_t GLYPH_R[7] = {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11};
+    static const uint8_t GLYPH_T[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04};
+    static const uint8_t GLYPH_V[7] = {0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04};
+    static const uint8_t GLYPH_X[7] = {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11};
+    static const uint8_t GLYPH_Y[7] = {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04};
+
+    const uint8_t *glyph = NULL;
+    char upper = letter;
+    if (upper >= 'a' && upper <= 'z') {
+        upper = (char)(upper - ('a' - 'A'));
+    }
+
+    switch (upper) {
+        case 'A': glyph = GLYPH_A; break;
+        case 'C': glyph = GLYPH_C; break;
+        case 'E': glyph = GLYPH_E; break;
+        case 'L': glyph = GLYPH_L; break;
+        case 'M': glyph = GLYPH_M; break;
+        case 'N': glyph = GLYPH_N; break;
+        case 'O': glyph = GLYPH_O; break;
+        case 'R': glyph = GLYPH_R; break;
+        case 'T': glyph = GLYPH_T; break;
+        case 'V': glyph = GLYPH_V; break;
+        case 'X': glyph = GLYPH_X; break;
+        case 'Y': glyph = GLYPH_Y; break;
+        default:
+            return;
+    }
+
+    for (int row = 0; row < 7; row++) {
+        for (int col = 0; col < 5; col++) {
+            if (glyph[row] & (1 << (4 - col))) {
+                display_set_pixel(x + col, y + row, true);
             }
-            // Top horizontal line
-            for (int i = 0; i < 6; i++) {
-                display_set_pixel(x + i, y, true);
-            }
-            // Middle horizontal line
-            for (int i = 0; i < 5; i++) {
-                display_set_pixel(x + i, y + 6, true);
-            }
-            // Top right vertical
-            for (int i = 1; i < 6; i++) {
-                display_set_pixel(x + 5, y + i, true);
-            }
-            // Diagonal line
-            for (int i = 0; i < 5; i++) {
-                display_set_pixel(x + 2 + i, y + 7 + i, true);
-            }
-            break;
-            
-        case 'L':
-        case 'l':
-            // Draw "L" - original design, coordinates will be rotated by display_set_pixel
-            // Vertical line
-            for (int i = 0; i < 12; i++) {
-                display_set_pixel(x, y + i, true);
-            }
-            // Bottom horizontal line
-            for (int i = 0; i < 7; i++) {
-                display_set_pixel(x + i, y + 11, true);
-            }
-            break;
-            
-        case 'X':
-        case 'x':
-            // X 
-            for (int i = 0; i < 8; i++) {
-                display_set_pixel(x + i, y + i, true);        
-                display_set_pixel(x + 7 - i, y + i, true);    
-            }
-            break;
-            
-        case 'Y':
-        case 'y':
-            // Y
-            for (int i = 0; i < 4; i++) {
-                display_set_pixel(x + i, y + i, true);        
-                display_set_pixel(x + 7 - i, y + i, true);    
-            }
-            for (int i = 4; i < 8; i++) {
-                display_set_pixel(x + 3, y + i, true);
-            }
-            break;
-            
-        case 'T':
-        case 't':
-            // T
-            for (int i = 0; i < 8; i++) {
-                display_set_pixel(x + i, y, true);
-            }
-            for (int i = 0; i < 6; i++) {
-                display_set_pixel(x + 4, y + i, true);
-            }
-            break;
+        }
+    }
+}
+
+static void display_draw_word(int16_t x, int16_t y, const char *text)
+{
+    if (!text) {
+        return;
+    }
+
+    int16_t cx = x;
+    for (size_t i = 0; text[i] != '\0'; i++) {
+        display_draw_letter(text[i], cx, y);
+        cx += 6; // 5px glyph + 1px spacing
     }
 }
 
@@ -148,9 +134,9 @@ void display_draw_letter(char letter, int16_t x, int16_t y)
 void display_draw_controller_id(uint8_t ctrl_id)
 {
     // Just draw to buffer, don't write to display yet
-    // Position the letter in the center - simple approach
-    int16_t letter_x = DISPLAY_WIDTH / 2 - 6;
-    int16_t letter_y = DISPLAY_HEIGHT / 2 - 3;
+    // Position for 5x7 glyph in center
+    int16_t letter_x = (DISPLAY_WIDTH - 5) / 2;
+    int16_t letter_y = (DISPLAY_HEIGHT - 7) / 2;
     
     if (ctrl_id == 0) {
         display_draw_letter('R', letter_x, letter_y);
@@ -519,28 +505,19 @@ void display_show_status_screen(void)
 void display_show_calibration_screen(uint8_t phase, uint8_t progress)
 {
     display_clear();
-    
-    // Draw title "CAL" at top center
-    display_draw_letter('C', 50, 2);
-    display_draw_letter('A', 55, 2);
-    display_draw_letter('L', 60, 2);
-    
-    // Draw phase message
-    if (phase == 0) {
-        // Centering phase "CENTER"
-        display_draw_letter('C', 30, 12);
-        display_draw_letter('E', 35, 12);
-        display_draw_letter('N', 40, 12);
-        display_draw_letter('T', 45, 12);
-        display_draw_letter('E', 50, 12);
-        display_draw_letter('R', 55, 12);
-    } else {
-        // Movement phase "MOVE"
-        display_draw_letter('M', 38, 12);
-        display_draw_letter('O', 43, 12);
-        display_draw_letter('V', 48, 12);
-        display_draw_letter('E', 53, 12);
-    }
+
+    const char *title = "CAL";
+    int title_width = (int)strlen(title) * 6 - 1;
+    int16_t title_x = (DISPLAY_WIDTH - title_width) / 2;
+    display_draw_word(title_x, 2, title);
+
+    const char *phase_text = (phase == 0) ? "CENTER" : "MOVE";
+    int phase_width = (int)strlen(phase_text) * 6 - 1;
+    int16_t phase_x = (DISPLAY_WIDTH - phase_width) / 2;
+    display_draw_word(phase_x, 12, phase_text);
+
+    // Side marker to confirm LEFT/RIGHT selection on this screen
+    display_draw_letter((controller_id == 0) ? 'R' : 'L', 120, 2);
     
     // Draw progress bar
     int16_t bar_width = (progress * 100) / 100;  // Scale to 100 pixels wide

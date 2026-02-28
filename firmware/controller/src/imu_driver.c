@@ -7,6 +7,22 @@
 
 LOG_MODULE_REGISTER(imu_driver, LOG_LEVEL_ERR);
 
+#define IMU_GRAVITY_MPS2 9.81
+#define IMU_STILL_ACCEL_TOLERANCE_MPS2 0.8
+#define IMU_STILL_GYRO_THRESHOLD_RAD_S 0.08
+#define IMU_DRIFT_BIAS_ALPHA 0.01
+#define IMU_GYRO_RADIAL_DEADBAND_RAD_S 0.01
+#define IMU_GYRO_OUTPUT_DEADBAND_COUNTS 35
+
+typedef struct {
+    double gyro_bias_x;
+    double gyro_bias_y;
+    double gyro_bias_z;
+    uint32_t still_sample_count;
+} imu_drift_comp_t;
+
+static imu_drift_comp_t imu_drift_comp = {0};
+
 // Global IMU context
 static imu_context_t imu_ctx = {
     .sensor_dev = NULL,
@@ -30,6 +46,24 @@ static const imu_config_t DEFAULT_CONFIG = {
     .gyro_scale_factor = 1200.0f    // Scale to controller range
 };
 
+static void imu_update_runtime_gyro_bias(bool is_still, double gx, double gy, double gz)
+{
+    if (is_still) {
+        if (imu_drift_comp.still_sample_count < UINT32_MAX) {
+            imu_drift_comp.still_sample_count++;
+        }
+
+        // Require short still period before adapting bias
+        if (imu_drift_comp.still_sample_count >= 20) {
+            imu_drift_comp.gyro_bias_x = (1.0 - IMU_DRIFT_BIAS_ALPHA) * imu_drift_comp.gyro_bias_x + IMU_DRIFT_BIAS_ALPHA * gx;
+            imu_drift_comp.gyro_bias_y = (1.0 - IMU_DRIFT_BIAS_ALPHA) * imu_drift_comp.gyro_bias_y + IMU_DRIFT_BIAS_ALPHA * gy;
+            imu_drift_comp.gyro_bias_z = (1.0 - IMU_DRIFT_BIAS_ALPHA) * imu_drift_comp.gyro_bias_z + IMU_DRIFT_BIAS_ALPHA * gz;
+        }
+    } else {
+        imu_drift_comp.still_sample_count = 0;
+    }
+}
+
 /**
  * @brief Initialize the IMU driver system
  */
@@ -41,6 +75,7 @@ int imu_driver_init(const struct device *sensor_dev,
     
     // Clear the context
     memset(&imu_ctx, 0, sizeof(imu_ctx));
+    memset(&imu_drift_comp, 0, sizeof(imu_drift_comp));
     imu_ctx.status = IMU_STATUS_NOT_READY;
     
     // Store device references
@@ -187,6 +222,37 @@ int imu_read_raw_data(imu_raw_data_t *raw_data)
     imu_ctx.raw_data.gyro_x -= imu_ctx.calibration.gyro_offset_x;
     imu_ctx.raw_data.gyro_y -= imu_ctx.calibration.gyro_offset_y;
     imu_ctx.raw_data.gyro_z -= imu_ctx.calibration.gyro_offset_z;
+
+    // Runtime gyro drift compensation while controller is still (skip during explicit calibration)
+    if (imu_ctx.status != IMU_STATUS_CALIBRATING) {
+        const double accel_mag_sq = imu_ctx.raw_data.accel_x * imu_ctx.raw_data.accel_x +
+                                   imu_ctx.raw_data.accel_y * imu_ctx.raw_data.accel_y +
+                                   imu_ctx.raw_data.accel_z * imu_ctx.raw_data.accel_z;
+        const double accel_min = IMU_GRAVITY_MPS2 - IMU_STILL_ACCEL_TOLERANCE_MPS2;
+        const double accel_max = IMU_GRAVITY_MPS2 + IMU_STILL_ACCEL_TOLERANCE_MPS2;
+        const double accel_min_sq = accel_min * accel_min;
+        const double accel_max_sq = accel_max * accel_max;
+
+        const bool accel_stable = (accel_mag_sq >= accel_min_sq) && (accel_mag_sq <= accel_max_sq);
+        const bool gyro_quiet = (fabs(imu_ctx.raw_data.gyro_x) < IMU_STILL_GYRO_THRESHOLD_RAD_S) &&
+                                (fabs(imu_ctx.raw_data.gyro_y) < IMU_STILL_GYRO_THRESHOLD_RAD_S) &&
+                                (fabs(imu_ctx.raw_data.gyro_z) < IMU_STILL_GYRO_THRESHOLD_RAD_S);
+        const bool is_still = accel_stable && gyro_quiet;
+
+        imu_update_runtime_gyro_bias(is_still,
+                                     imu_ctx.raw_data.gyro_x,
+                                     imu_ctx.raw_data.gyro_y,
+                                     imu_ctx.raw_data.gyro_z);
+
+        imu_ctx.raw_data.gyro_x -= imu_drift_comp.gyro_bias_x;
+        imu_ctx.raw_data.gyro_y -= imu_drift_comp.gyro_bias_y;
+        imu_ctx.raw_data.gyro_z -= imu_drift_comp.gyro_bias_z;
+
+        // Small deadband at sensor level to suppress tiny residual drift
+        if (fabs(imu_ctx.raw_data.gyro_x) < IMU_GYRO_RADIAL_DEADBAND_RAD_S) imu_ctx.raw_data.gyro_x = 0.0;
+        if (fabs(imu_ctx.raw_data.gyro_y) < IMU_GYRO_RADIAL_DEADBAND_RAD_S) imu_ctx.raw_data.gyro_y = 0.0;
+        if (fabs(imu_ctx.raw_data.gyro_z) < IMU_GYRO_RADIAL_DEADBAND_RAD_S) imu_ctx.raw_data.gyro_z = 0.0;
+    }
     
     // Apply low-pass filter
     if (!imu_ctx.filtered_data.filter_initialized) {
@@ -267,6 +333,11 @@ int imu_get_controller_data(imu_controller_data_t *controller_data)
     controller_data->gyro_x = (int16_t)((temp_gx < -32768) ? -32768 : ((temp_gx > 32767) ? 32767 : temp_gx));
     controller_data->gyro_y = (int16_t)((temp_gy < -32768) ? -32768 : ((temp_gy > 32767) ? 32767 : temp_gy));
     controller_data->gyro_z = (int16_t)((temp_gz < -32768) ? -32768 : ((temp_gz > 32767) ? 32767 : temp_gz));
+
+    // Final deadband in controller output space to prevent slow in-game camera creep
+    if (abs(controller_data->gyro_x) < IMU_GYRO_OUTPUT_DEADBAND_COUNTS) controller_data->gyro_x = 0;
+    if (abs(controller_data->gyro_y) < IMU_GYRO_OUTPUT_DEADBAND_COUNTS) controller_data->gyro_y = 0;
+    if (abs(controller_data->gyro_z) < IMU_GYRO_OUTPUT_DEADBAND_COUNTS) controller_data->gyro_z = 0;
     
     return 0;
 }
@@ -449,6 +520,7 @@ int imu_set_calibration(const imu_calibration_t *calibration)
 int imu_reset_calibration(void)
 {
     memset(&imu_ctx.calibration, 0, sizeof(imu_ctx.calibration));
+    memset(&imu_drift_comp, 0, sizeof(imu_drift_comp));
     LOG_DBG("IMU calibration reset to defaults");
     return 0;
 }

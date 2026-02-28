@@ -178,6 +178,16 @@ static controller_preferences_t controller_preferences;
 // Controller state
 static esb_controller_data_t controller_data = {0};
 
+// ACK rumble -> DRV2605 effect switching state (shared motor with trackpad clicks)
+static const drv2605_effect_t HAPTIC_CLICK_EFFECT = DRV2605_EFFECT_SHARP_TICK_2;
+static const drv2605_effect_t HAPTIC_RUMBLE_EFFECT = DRV2605_EFFECT_STRONG_BUZZ_100;
+static bool ack_rumble_mode_active = false;
+static uint32_t ack_rumble_last_nonzero_ms = 0;
+static uint32_t ack_rumble_last_pulse_ms = 0;
+static const uint32_t ACK_RUMBLE_RESTORE_DELAY_MS = 180;
+static volatile bool trackpad_init_in_progress = false;
+static volatile bool trackpad_init_complete = false;
+
 // Function declarations
 void buttons_init(void);                      // Initialize button driver
 void adc_init(void);                          // Initialize analog driver
@@ -196,6 +206,87 @@ void ui_create_menu_screen(void);
 void ui_create_calibration_screen(void);
 void ui_update_data(void);
 void ui_handle_input(void);
+static void process_ack_rumble_haptics(uint8_t left_rumble, uint8_t right_rumble);
+
+static void process_ack_rumble_haptics(uint8_t left_rumble, uint8_t right_rumble)
+{
+        if (!haptic_is_available())
+        {
+                return;
+        }
+
+        // Do not vibrate while the trackpad is still initializing
+        if (trackpad_init_in_progress || !trackpad_init_complete)
+        {
+                return;
+        }
+
+        uint8_t rumble_level = (left_rumble > right_rumble) ? left_rumble : right_rumble;
+        uint32_t now = k_uptime_get_32();
+
+        if (rumble_level > 0)
+        {
+                ack_rumble_last_nonzero_ms = now;
+
+                // Temporarily switch external-trigger waveform to rumble effect
+                if (!ack_rumble_mode_active)
+                {
+                        if (haptic_set_trigger_effect(HAPTIC_RUMBLE_EFFECT) == 0)
+                        {
+                                ack_rumble_mode_active = true;
+                                (void)haptic_trigger_pulse();
+                                ack_rumble_last_pulse_ms = now;
+                                LOG_INF("ACK rumble active - switched haptic effect to buzz");
+                        }
+                        else
+                        {
+                                LOG_WRN("Failed to switch to rumble effect");
+                                return;
+                        }
+                }
+
+                // Tuned pulse cadence bands for smoother perceived intensity
+                uint32_t pulse_interval_ms = 120;
+                if (rumble_level >= 12)
+                {
+                        pulse_interval_ms = 32;
+                }
+                else if (rumble_level >= 8)
+                {
+                        pulse_interval_ms = 48;
+                }
+                else if (rumble_level >= 4)
+                {
+                        pulse_interval_ms = 72;
+                }
+                else
+                {
+                        pulse_interval_ms = 108;
+                }
+
+                if ((now - ack_rumble_last_pulse_ms) >= pulse_interval_ms)
+                {
+                        (void)haptic_trigger_pulse();
+                        ack_rumble_last_pulse_ms = now;
+                }
+        }
+        else if (ack_rumble_mode_active)
+        {
+                // Keep rumble effect briefly to avoid rapid mode thrash from packet jitter
+                if ((now - ack_rumble_last_nonzero_ms) >= ACK_RUMBLE_RESTORE_DELAY_MS)
+                {
+                        if (haptic_set_trigger_effect(HAPTIC_CLICK_EFFECT) == 0)
+                        {
+                                ack_rumble_mode_active = false;
+                                LOG_INF("ACK rumble inactive - restored click effect");
+                        }
+                        else
+                        {
+                                LOG_WRN("Failed to restore click effect after rumble");
+                        }
+                }
+        }
+}
 
 // Initialize ESB communication using ESB driver library
 void esb_comm_init(void)
@@ -253,21 +344,21 @@ esb_comm_status_t send_controller_data(void)
         // Use the ESB communication driver for transmission
         esb_comm_status_t status = esb_comm_send_data(&controller_data);
 
-        // Process ACK payload data if transmission was successful
-        if (status == ESB_COMM_STATUS_OK)
+        // Process latest ACK rumble command (if any) without blocking main loop
+        uint8_t left_rumble = 0;
+        uint8_t right_rumble = 0;
+        esb_comm_status_t rumble_status = esb_comm_get_rumble_data(&left_rumble, &right_rumble);
+        if (rumble_status == ESB_COMM_STATUS_OK)
         {
-                // Check for rumble data from dongle
-                uint8_t left_rumble, right_rumble;
-                esb_comm_status_t rumble_status = esb_comm_get_rumble_data(&left_rumble, &right_rumble);
+                process_ack_rumble_haptics(left_rumble, right_rumble);
 
-                if (rumble_status == ESB_COMM_STATUS_OK && (left_rumble > 0 || right_rumble > 0))
+                if (left_rumble > 0 || right_rumble > 0)
                 {
-                        // TODO: Implement rumble motor control when hardware is ready
                         static uint32_t last_rumble_log = 0;
                         uint32_t now = k_uptime_get_32();
                         if ((now - last_rumble_log) > 1000)
-                        { // Log every 1 second to avoid spam
-                                LOG_DBG("Rumble data received - Left: %d/15, Right: %d/15", left_rumble, right_rumble);
+                        {
+                                LOG_DBG("ACK rumble command - Left: %d/15, Right: %d/15", left_rumble, right_rumble);
                                 last_rumble_log = now;
                         }
                 }
@@ -426,14 +517,18 @@ bool init_trackpad_arduino_hybrid(void)
 {
         LOG_INF("=== ARDUINO HYBRID TRACKPAD INIT ===");
 
+        // Reset per-attempt state
+        trackpad_arduino_initialized = false;
+
         // Initialize the Arduino-style IQS7211E library
         iqs7211e_begin(&trackpad_instance, 0x56, 5); // Address 0x56, RDY pin 5
         LOG_INF("Arduino IQS7211E begin() called");
 
         // Run the full Arduino initialization sequence
         uint32_t init_start = k_uptime_get_32();
-        while (!trackpad_arduino_initialized && (k_uptime_get_32() - init_start) < 5000)
-        { // 5 second timeout (reduced from 30s to prevent long freezes)
+        uint32_t last_progress = 0;
+        while (!trackpad_arduino_initialized && (k_uptime_get_32() - init_start) < 2500)
+        { // 2.5 second timeout per attempt
                 iqs7211e_run(&trackpad_instance);
 
                 // Check if initialization is complete
@@ -445,15 +540,16 @@ bool init_trackpad_arduino_hybrid(void)
                 }
 
                 // Log progress every 2 seconds - reduced verbosity
-                static uint32_t last_progress = 0;
                 uint32_t now = k_uptime_get_32();
-                if ((now - last_progress) > 5000) // Increased from 2 to 5 seconds
+                if ((now - last_progress) > 1000)
                 {
-                        // Reduced Arduino init progress logging
+                        LOG_DBG("Trackpad init in progress... state=%d init_state=%d",
+                                trackpad_instance.iqs7211e_state.state,
+                                trackpad_instance.iqs7211e_state.init_state);
                         last_progress = now;
                 }
 
-                k_sleep(K_MSEC(100));
+                k_sleep(K_MSEC(20));
         }
 
         if (!trackpad_arduino_initialized)
@@ -895,6 +991,11 @@ void trackpad_rdy_interrupt_handler(const struct device *dev, struct gpio_callba
 // Add this function to trigger haptic via GPIO pin
 void check_trackpad_haptic_feedback(uint16_t new_x, uint16_t new_y)
 {
+        if (trackpad_init_in_progress || !trackpad_init_complete)
+        {
+                return;
+        }
+
         static uint16_t last_x = 0;
         static uint16_t last_y = 0;
         static bool first_read = true;
@@ -948,14 +1049,38 @@ void trackpad_thread_entry(void *p1, void *p2, void *p3)
         ARG_UNUSED(p3);
 
         // Wait for system to boot up and I2C to stabilize
-        k_sleep(K_MSEC(500));  // Reduced from 3000ms to 500ms - I2C is ready much faster
+        k_sleep(K_MSEC(200));
 
-        // Use Arduino library for initialization
-        if (!init_trackpad_arduino_hybrid())
+        trackpad_init_in_progress = true;
+        trackpad_init_complete = false;
+
+        bool trackpad_ok = false;
+        for (int attempt = 1; attempt <= 3; attempt++)
         {
-                LOG_ERR("Arduino hybrid trackpad init failed");
+                if (attempt > 1)
+                {
+                        LOG_WRN("Retrying trackpad init (attempt %d/3)", attempt);
+                        k_sleep(K_MSEC(120));
+                }
+
+                if (init_trackpad_arduino_hybrid())
+                {
+                        trackpad_ok = true;
+                        break;
+                }
+        }
+
+        if (!trackpad_ok)
+        {
+                LOG_ERR("Arduino hybrid trackpad init failed after retries");
+                trackpad_init_in_progress = false;
                 return;
         }
+
+        // Let trackpad settle before allowing shared haptic motor activity
+        k_sleep(K_MSEC(120));
+        trackpad_init_complete = true;
+        trackpad_init_in_progress = false;
 
         // Configure RDY pin for interrupt-based reading
         if (!gpio_is_ready_dt(&trackpad_rdy))
@@ -1851,15 +1976,6 @@ int main(void)
                 if (ret != 0)
                 {
                         LOG_WRN("Haptic external trigger setup failed: %d", ret);
-                }
-                else
-                {
-                        // Test haptic motor with a quick pulse to verify it's working
-                        k_sleep(K_MSEC(50));
-                        gpio_pin_set_dt(&haptic_trigger, 1);
-                        k_sleep(K_MSEC(50));
-                        gpio_pin_set_dt(&haptic_trigger, 0);
-                        LOG_INF("Haptic motor test pulse sent");
                 }
         }
 
