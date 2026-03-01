@@ -8,7 +8,7 @@ LOG_MODULE_REGISTER(controller_esb, LOG_LEVEL_INF);
 
 
 // Define the player ID for the controller
-#define PLAYER_ID 1
+#define PLAYER_ID 2
 
 // ESB data structures
 static struct esb_payload rx_payload;
