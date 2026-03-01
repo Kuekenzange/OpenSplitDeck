@@ -218,12 +218,23 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
     // Handle output reports (type 2) - can be Report ID 0x00 or 0x03
     if (type == 2)
     {
-        if (buf && len >= 2)
+        if (buf && len >= 1)
         {
-            // When report ID is sent with the data:
-            // buf[0] = report ID (0x03)
-            // buf[1] = command ID (0x01, 0x02, 0x03, 0x04, etc.)
-            uint8_t command_id = buf[1];
+            // Some hosts include report ID in buf[0], others don't.
+            // Normalize so payload[0] is always command_id.
+            const uint8_t *payload = buf;
+            uint16_t payload_len = len;
+            if (id != 0 && buf[0] == id && len > 1) {
+                payload = &buf[1];
+                payload_len = len - 1;
+            }
+ 
+            if (payload_len < 1) {
+                return 0;
+            }
+
+            // payload[0] = command ID (0x01, 0x02, 0x03, 0x04, etc.)
+            uint8_t command_id = payload[0];
             
             LOG_INF("S-Input command received: 0x%02x (report_id=0x%02x)", command_id, id);
             
@@ -237,19 +248,29 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
                 }                
                 case 0x01: // Haptics command
                 {
-                    if (len >= 3)
+                    if (payload_len >= 2)
                     {
-                        uint8_t haptic_type = buf[1];
+                        uint8_t haptic_type = payload[1];
+                        LOG_INF("RUMBLE CMD: len=%u type=0x%02x b0=%02x b1=%02x b2=%02x b3=%02x b4=%02x b5=%02x",
+                                len,
+                                haptic_type,
+                                buf[0],
+                                len > 1 ? buf[1] : 0,
+                                len > 2 ? buf[2] : 0,
+                                len > 3 ? buf[3] : 0,
+                                len > 4 ? buf[4] : 0,
+                                len > 5 ? buf[5] : 0);
                         
-                        if (haptic_type == 0x02 && len >= 6)
+                        if (haptic_type == 0x02 && payload_len >= 6)
                         {
                             // Type 2 - ERM Stereo Haptics (simple)
-                            uint8_t left_amplitude = buf[2];
-                            // bool left_brake = buf[3]; // Could be used for more advanced control
-                            uint8_t right_amplitude = buf[4];
-                            // bool right_brake = buf[5];
+                            uint8_t left_amplitude = payload[2];
+                            // bool left_brake = payload[3]; // Could be used for more advanced control
+                            uint8_t right_amplitude = payload[4];
+                            // bool right_brake = payload[5];
                             
                             LOG_DBG("Haptics Type 2: L=%u, R=%u", left_amplitude, right_amplitude);
+                            LOG_INF("RUMBLE TYPE2: L=%u R=%u", left_amplitude, right_amplitude);
                             
                             // Call haptics callback if registered
                             if (haptics_callback)
@@ -257,23 +278,28 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
                                 haptics_callback(left_amplitude, right_amplitude);
                             }
                         }
-                        else if (haptic_type == 0x01 && len >= 18)
+                        else if (haptic_type == 0x01 && payload_len >= 18)
                         {
                             // Type 1 - Precise Stereo Haptics (frequency/amplitude pairs)
                             // This is more complex - could convert to simple amplitude
-                            uint16_t left_amp1 = (buf[4] << 8) | buf[3];
-                            uint16_t right_amp1 = (buf[12] << 8) | buf[11];
+                            uint16_t left_amp1 = ((uint16_t)payload[4] << 8) | payload[3];
+                            uint16_t right_amp1 = ((uint16_t)payload[12] << 8) | payload[11];
                             
                             // Convert 16-bit to 8-bit amplitude
                             uint8_t left_amp = (uint8_t)(left_amp1 >> 8);
                             uint8_t right_amp = (uint8_t)(right_amp1 >> 8);
                             
                             LOG_DBG("Haptics Type 1: L=%u, R=%u", left_amp, right_amp);
+                            LOG_INF("RUMBLE TYPE1: L=%u R=%u", left_amp, right_amp);
                             
                             if (haptics_callback)
                             {
                                 haptics_callback(left_amp, right_amp);
                             }
+                        }
+                        else
+                        {
+                            LOG_WRN("RUMBLE CMD: unhandled format type=0x%02x len=%u", haptic_type, len);
                         }
                     }
                     break;
@@ -281,9 +307,9 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
                 
                 case 0x03: // Player LEDs
                 {
-                    if (len >= 2)
+                    if (payload_len >= 2)
                     {
-                        uint8_t player_num = buf[1];
+                        uint8_t player_num = payload[1];
                         LOG_DBG("Player LED: %u", player_num);
                         // TODO: Could implement player LED control
                     }
@@ -292,11 +318,11 @@ static int set_report_cb(const struct device *dev, const uint8_t type, const uin
                 
                 case 0x04: // Joystick RGB
                 {
-                    if (len >= 4)
+                    if (payload_len >= 4)
                     {
-                        uint8_t red = buf[1];
-                        uint8_t green = buf[2];
-                        uint8_t blue = buf[3];
+                        uint8_t red = payload[1];
+                        uint8_t green = payload[2];
+                        uint8_t blue = payload[3];
                         LOG_DBG("Joystick RGB: R=%u, G=%u, B=%u", red, green, blue);
                         // TODO: Could implement RGB LED control
                     }

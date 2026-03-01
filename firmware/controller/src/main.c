@@ -149,7 +149,7 @@ static const struct gpio_dt_spec vbat_enable = {
 static const struct gpio_dt_spec trackpad_rdy = {
     .port = DEVICE_DT_GET(DT_NODELABEL(gpio1)),
     .pin = 5, // P1.05 - RDY pin from trackpad
-    .dt_flags = GPIO_ACTIVE_LOW | GPIO_INT_EDGE_FALLING};
+        .dt_flags = GPIO_ACTIVE_LOW};
 
 // Removed unused trackpad_ready GPIO spec
 
@@ -178,6 +178,16 @@ static controller_preferences_t controller_preferences;
 // Controller state
 static esb_controller_data_t controller_data = {0};
 
+// ACK rumble -> DRV2605 effect switching state (shared motor with trackpad clicks)
+static const drv2605_effect_t HAPTIC_CLICK_EFFECT = DRV2605_EFFECT_SHARP_TICK_2;
+static const drv2605_effect_t HAPTIC_RUMBLE_EFFECT = DRV2605_EFFECT_STRONG_BUZZ_100;
+static bool ack_rumble_mode_active = false;
+static uint32_t ack_rumble_last_nonzero_ms = 0;
+static uint32_t ack_rumble_last_pulse_ms = 0;
+static const uint32_t ACK_RUMBLE_RESTORE_DELAY_MS = 180;
+static volatile bool trackpad_init_in_progress = false;
+static volatile bool trackpad_init_complete = false;
+
 // Function declarations
 void buttons_init(void);                      // Initialize button driver
 void adc_init(void);                          // Initialize analog driver
@@ -186,7 +196,6 @@ void read_button_inputs(void);                // Read buttons using driver
 void read_analog_inputs(void);                // Read analog using driver
 void print_analog_values(void);               // Debug: print all analog values
 void calibrate_analog_inputs(void);           // Calibrate analog using driver
-void read_trackpad_inputs(void);              // Read trackpad using driver
 void read_imu_inputs(void);                   // Read IMU using driver
 esb_comm_status_t send_controller_data(void); // Send data using ESB driver
 void power_mgmt_init(void);                   // Initialize power management driver
@@ -196,6 +205,88 @@ void ui_create_menu_screen(void);
 void ui_create_calibration_screen(void);
 void ui_update_data(void);
 void ui_handle_input(void);
+static void process_ack_rumble_haptics(uint8_t left_rumble, uint8_t right_rumble);
+static bool trackpad_wait_rdy_low(uint32_t timeout_ms);
+
+static void process_ack_rumble_haptics(uint8_t left_rumble, uint8_t right_rumble)
+{
+        if (!haptic_is_available())
+        {
+                return;
+        }
+
+        // Do not vibrate while the trackpad is still initializing
+        if (trackpad_init_in_progress || !trackpad_init_complete)
+        {
+                return;
+        }
+
+        uint8_t rumble_level = (left_rumble > right_rumble) ? left_rumble : right_rumble;
+        uint32_t now = k_uptime_get_32();
+
+        if (rumble_level > 0)
+        {
+                ack_rumble_last_nonzero_ms = now;
+
+                // Temporarily switch external-trigger waveform to rumble effect
+                if (!ack_rumble_mode_active)
+                {
+                        if (haptic_set_trigger_effect(HAPTIC_RUMBLE_EFFECT) == 0)
+                        {
+                                ack_rumble_mode_active = true;
+                                (void)haptic_trigger_pulse();
+                                ack_rumble_last_pulse_ms = now;
+                                LOG_INF("ACK rumble active - switched haptic effect to buzz");
+                        }
+                        else
+                        {
+                                LOG_WRN("Failed to switch to rumble effect");
+                                return;
+                        }
+                }
+
+                // Tuned pulse cadence bands for smoother perceived intensity
+                uint32_t pulse_interval_ms = 120;
+                if (rumble_level >= 12)
+                {
+                        pulse_interval_ms = 32;
+                }
+                else if (rumble_level >= 8)
+                {
+                        pulse_interval_ms = 48;
+                }
+                else if (rumble_level >= 4)
+                {
+                        pulse_interval_ms = 72;
+                }
+                else
+                {
+                        pulse_interval_ms = 108;
+                }
+
+                if ((now - ack_rumble_last_pulse_ms) >= pulse_interval_ms)
+                {
+                        (void)haptic_trigger_pulse();
+                        ack_rumble_last_pulse_ms = now;
+                }
+        }
+        else if (ack_rumble_mode_active)
+        {
+                // Keep rumble effect briefly to avoid rapid mode thrash from packet jitter
+                if ((now - ack_rumble_last_nonzero_ms) >= ACK_RUMBLE_RESTORE_DELAY_MS)
+                {
+                        if (haptic_set_trigger_effect(HAPTIC_CLICK_EFFECT) == 0)
+                        {
+                                ack_rumble_mode_active = false;
+                                LOG_INF("ACK rumble inactive - restored click effect");
+                        }
+                        else
+                        {
+                                LOG_WRN("Failed to restore click effect after rumble");
+                        }
+                }
+        }
+}
 
 // Initialize ESB communication using ESB driver library
 void esb_comm_init(void)
@@ -253,21 +344,21 @@ esb_comm_status_t send_controller_data(void)
         // Use the ESB communication driver for transmission
         esb_comm_status_t status = esb_comm_send_data(&controller_data);
 
-        // Process ACK payload data if transmission was successful
-        if (status == ESB_COMM_STATUS_OK)
+        // Process latest ACK rumble command (if any) without blocking main loop
+        uint8_t left_rumble = 0;
+        uint8_t right_rumble = 0;
+        esb_comm_status_t rumble_status = esb_comm_get_rumble_data(&left_rumble, &right_rumble);
+        if (rumble_status == ESB_COMM_STATUS_OK)
         {
-                // Check for rumble data from dongle
-                uint8_t left_rumble, right_rumble;
-                esb_comm_status_t rumble_status = esb_comm_get_rumble_data(&left_rumble, &right_rumble);
+                process_ack_rumble_haptics(left_rumble, right_rumble);
 
-                if (rumble_status == ESB_COMM_STATUS_OK && (left_rumble > 0 || right_rumble > 0))
+                if (left_rumble > 0 || right_rumble > 0)
                 {
-                        // TODO: Implement rumble motor control when hardware is ready
                         static uint32_t last_rumble_log = 0;
                         uint32_t now = k_uptime_get_32();
                         if ((now - last_rumble_log) > 1000)
-                        { // Log every 1 second to avoid spam
-                                LOG_DBG("Rumble data received - Left: %d/15, Right: %d/15", left_rumble, right_rumble);
+                        {
+                                LOG_DBG("ACK rumble command - Left: %d/15, Right: %d/15", left_rumble, right_rumble);
                                 last_rumble_log = now;
                         }
                 }
@@ -426,14 +517,18 @@ bool init_trackpad_arduino_hybrid(void)
 {
         LOG_INF("=== ARDUINO HYBRID TRACKPAD INIT ===");
 
+        // Reset per-attempt state
+        trackpad_arduino_initialized = false;
+
         // Initialize the Arduino-style IQS7211E library
         iqs7211e_begin(&trackpad_instance, 0x56, 5); // Address 0x56, RDY pin 5
         LOG_INF("Arduino IQS7211E begin() called");
 
         // Run the full Arduino initialization sequence
         uint32_t init_start = k_uptime_get_32();
-        while (!trackpad_arduino_initialized && (k_uptime_get_32() - init_start) < 5000)
-        { // 5 second timeout (reduced from 30s to prevent long freezes)
+        uint32_t last_progress = 0;
+        while (!trackpad_arduino_initialized && (k_uptime_get_32() - init_start) < 7000)
+        { // 7 second timeout per attempt (ATI and RDY windows can be slow at boot)
                 iqs7211e_run(&trackpad_instance);
 
                 // Check if initialization is complete
@@ -445,15 +540,16 @@ bool init_trackpad_arduino_hybrid(void)
                 }
 
                 // Log progress every 2 seconds - reduced verbosity
-                static uint32_t last_progress = 0;
                 uint32_t now = k_uptime_get_32();
-                if ((now - last_progress) > 5000) // Increased from 2 to 5 seconds
+                if ((now - last_progress) > 1000)
                 {
-                        // Reduced Arduino init progress logging
+                        LOG_DBG("Trackpad init in progress... state=%d init_state=%d",
+                                trackpad_instance.iqs7211e_state.state,
+                                trackpad_instance.iqs7211e_state.init_state);
                         last_progress = now;
                 }
 
-                k_sleep(K_MSEC(100));
+                k_sleep(K_MSEC(20));
         }
 
         if (!trackpad_arduino_initialized)
@@ -488,6 +584,11 @@ bool init_trackpad_arduino_hybrid(void)
 // Simple coordinate reading function with precise I2C timing diagnostics
 bool read_trackpad_coordinates_simple(uint16_t *x, uint16_t *y)
 {
+        if (x == NULL || y == NULL)
+        {
+                return false;
+        }
+
         // Use cycle counter for microsecond precision timing
         uint32_t cycles_start = k_cycle_get_32();
 
@@ -516,6 +617,26 @@ bool read_trackpad_coordinates_simple(uint16_t *x, uint16_t *y)
         }
 
         return false;
+}
+
+static bool trackpad_coordinates_are_valid(uint16_t x, uint16_t y)
+{
+        if (x == 0xFFFF || y == 0xFFFF)
+        {
+                return false;
+        }
+
+        if (x == 0 && y == 0)
+        {
+                return false;
+        }
+
+        if (x > 1023 || y > 1023)
+        {
+                return false;
+        }
+
+        return true;
 }
 
 // Add this to your main.c - minimal direct trackpad init
@@ -693,174 +814,477 @@ bool init_trackpad_minimal(void)
 }
 
 // Replace your init_trackpad_enhanced() function with this C-compatible version:
+static int trackpad_rdy_read_raw(void)
+{
+        if (!gpio_is_ready_dt(&trackpad_rdy))
+        {
+                return -1;
+        }
+
+        return gpio_pin_get(trackpad_rdy.port, trackpad_rdy.pin);
+}
+
+static bool trackpad_wait_rdy_low(uint32_t timeout_ms)
+{
+        if (!gpio_is_ready_dt(&trackpad_rdy))
+        {
+                return true;
+        }
+
+        uint32_t start = k_uptime_get_32();
+        while ((k_uptime_get_32() - start) < timeout_ms)
+        {
+                int pin_state_raw = trackpad_rdy_read_raw();
+                if (pin_state_raw == 0)
+                {
+                        return true;
+                }
+                k_sleep(K_MSEC(2));
+        }
+
+        return false;
+}
+
+static void trackpad_force_comm_window(void)
+{
+        uint8_t force_cmd[] = {0xFF, 0x00};
+        int ret = i2c_write(i2c_dev, force_cmd, sizeof(force_cmd), 0x56);
+        if (ret != 0)
+        {
+                LOG_DBG("Trackpad force-comm write failed: %d", ret);
+        }
+        k_sleep(K_MSEC(4));
+}
+
+static bool trackpad_write_block_retry(uint8_t start_addr, const uint8_t *data, size_t len, const char *desc)
+{
+        if (len == 0 || len > 31)
+        {
+                return false;
+        }
+
+        uint8_t cmd[32];
+        cmd[0] = start_addr;
+        memcpy(&cmd[1], data, len);
+
+        const int max_attempts = 4;
+        int last_ret = 0;
+
+        for (int attempt = 1; attempt <= max_attempts; attempt++)
+        {
+                (void)trackpad_wait_rdy_low(120);
+                int ret = i2c_write(i2c_dev, cmd, len + 1, 0x56);
+                if (ret == 0)
+                {
+                        k_sleep(K_MSEC(3));
+                        return true;
+                }
+
+                last_ret = ret;
+                trackpad_force_comm_window();
+                if (attempt == max_attempts)
+                {
+                        int rdy_state = trackpad_rdy_read_raw();
+                        LOG_WRN("Trackpad block write failed (%s, start=0x%02X len=%u), attempts=%d, last_ret=%d, rdy=%d",
+                                desc,
+                                start_addr,
+                                (unsigned int)len,
+                                max_attempts,
+                                last_ret,
+                                rdy_state);
+                }
+
+                k_sleep(K_MSEC(15 * attempt));
+        }
+
+        return false;
+}
+
+static bool trackpad_update_sys_control_bits(uint8_t set_mask_byte0,
+                                             uint8_t clear_mask_byte0,
+                                             uint8_t set_mask_byte1,
+                                             uint8_t clear_mask_byte1,
+                                             const char *desc)
+{
+        uint8_t sys_ctrl[2] = {0};
+        uint8_t sys_ctrl_reg = IQS7211E_MM_SYS_CONTROL;
+
+        for (int attempt = 1; attempt <= 4; attempt++)
+        {
+                (void)trackpad_wait_rdy_low(120);
+
+                int read_ret = i2c_write_read(i2c_dev, 0x56, &sys_ctrl_reg, 1, sys_ctrl, 2);
+                if (read_ret != 0)
+                {
+                        trackpad_force_comm_window();
+                        if (attempt == 4)
+                        {
+                                LOG_WRN("Trackpad %s read SYS_CONTROL failed: %d", desc, read_ret);
+                                return false;
+                        }
+                        k_sleep(K_MSEC(12 * attempt));
+                        continue;
+                }
+
+                sys_ctrl[0] = (uint8_t)((sys_ctrl[0] | set_mask_byte0) & (uint8_t)(~clear_mask_byte0));
+                sys_ctrl[1] = (uint8_t)((sys_ctrl[1] | set_mask_byte1) & (uint8_t)(~clear_mask_byte1));
+
+                if (trackpad_write_block_retry(IQS7211E_MM_SYS_CONTROL, sys_ctrl, 2, desc))
+                {
+                        return true;
+                }
+
+                trackpad_force_comm_window();
+                k_sleep(K_MSEC(12 * attempt));
+        }
+
+        return false;
+}
+
 bool init_trackpad_enhanced(void)
 {
-        LOG_INF("=== ARDUINO-STYLE TRACKPAD INIT ===");
+        LOG_INF("=== TRACKPAD INIT (DETERMINISTIC) ===");
 
-        // Test I2C communication first
-        uint8_t test_data;
-        int ret = i2c_read(i2c_dev, &test_data, 1, 0x56);
+        if (gpio_is_ready_dt(&trackpad_rdy))
+        {
+                int rdy_state_raw = trackpad_rdy_read_raw();
+                LOG_INF("Trackpad RDY initial RAW state: %d (LOW=ready)", rdy_state_raw);
+        }
+        else
+        {
+                LOG_WRN("Trackpad RDY pin not ready during init");
+        }
+
+        if (!i2c_dev || !device_is_ready(i2c_dev))
+        {
+                LOG_ERR("Trackpad I2C device is not ready");
+                return false;
+        }
+
+        uint8_t prod_data[2] = {0};
+        int ret = -1;
+
+        // Probe product with short retry loop
+        for (int attempt = 1; attempt <= 5; attempt++)
+        {
+                (void)trackpad_wait_rdy_low(50);
+                uint8_t prod_reg = IQS7211E_MM_PROD_NUM;
+                ret = i2c_write_read(i2c_dev, 0x56, &prod_reg, 1, prod_data, 2);
+                if (ret == 0)
+                {
+                        LOG_INF("Trackpad product read OK (attempt %d): 0x%02X 0x%02X",
+                                attempt, prod_data[0], prod_data[1]);
+                        break;
+                }
+
+                if (attempt == 5)
+                {
+                        LOG_WRN("Trackpad product read failed after retries: %d", ret);
+                }
+                k_sleep(K_MSEC(15 * attempt));
+        }
+
         if (ret != 0)
         {
                 LOG_ERR("Trackpad not responding at 0x56: %d", ret);
                 return false;
         }
-        LOG_INF("Trackpad responds to I2C");
-
-        k_sleep(K_MSEC(100));
-
-        // 1. Read product number to verify device
-        uint8_t prod_data[2];
-        ret = i2c_write_read(i2c_dev, 0x56, "\x00", 1, prod_data, 2);
-        if (ret != 0)
-        {
-                LOG_ERR("Failed to read product number: %d", ret);
-                return false;
-        }
 
         uint16_t prod_num = prod_data[0] | (prod_data[1] << 8);
-        LOG_INF("Product number: 0x%04X", prod_num);
-
         if (prod_num != 0x0458)
         {
-                LOG_ERR("Wrong product number, expected 0x0458");
+                LOG_ERR("Wrong trackpad product number: 0x%04X", prod_num);
                 return false;
         }
 
-        // 2. Software reset - CORRECT ADDRESS
-        LOG_INF("Performing software reset...");
-        uint8_t reset_cmd[] = {0x51, 0x02}; // Write to SYSTEM_CONTROL_1, SW_RESET_BIT
-        ret = i2c_write(i2c_dev, reset_cmd, sizeof(reset_cmd), 0x56);
-        if (ret != 0)
+        LOG_INF("Trackpad product confirmed: 0x%04X", prod_num);
+        LOG_INF("Starting trackpad reset and register configuration");
+
+        // Software reset (takes effect after comm window terminates)
+        if (!trackpad_update_sys_control_bits(0x00, 0x00, 0x02, 0x00, "SW_RESET"))
         {
-                LOG_ERR("Software reset failed: %d", ret);
+                LOG_WRN("Trackpad SW reset did not ACK; continuing with config writes");
+        }
+
+        k_sleep(K_MSEC(120));
+
+        const uint8_t alp_ati_comp[] = {
+            ALP_COMPENSATION_A_0, ALP_COMPENSATION_A_1,
+            ALP_COMPENSATION_B_0, ALP_COMPENSATION_B_1};
+
+        const uint8_t ati_settings[] = {
+            TP_ATI_MULTIPLIERS_DIVIDERS_0, TP_ATI_MULTIPLIERS_DIVIDERS_1,
+            TP_COMPENSATION_DIV, TP_REF_DRIFT_LIMIT,
+            TP_ATI_TARGET_0, TP_ATI_TARGET_1,
+            TP_MIN_COUNT_REATI_0, TP_MIN_COUNT_REATI_1,
+            ALP_ATI_MULTIPLIERS_DIVIDERS_0, ALP_ATI_MULTIPLIERS_DIVIDERS_1,
+            ALP_COMPENSATION_DIV, ALP_LTA_DRIFT_LIMIT,
+            ALP_ATI_TARGET_0, ALP_ATI_TARGET_1};
+
+        const uint8_t rr_timing[] = {
+            ACTIVE_MODE_REPORT_RATE_0, ACTIVE_MODE_REPORT_RATE_1,
+            IDLE_TOUCH_MODE_REPORT_RATE_0, IDLE_TOUCH_MODE_REPORT_RATE_1,
+            IDLE_MODE_REPORT_RATE_0, IDLE_MODE_REPORT_RATE_1,
+            LP1_MODE_REPORT_RATE_0, LP1_MODE_REPORT_RATE_1,
+            LP2_MODE_REPORT_RATE_0, LP2_MODE_REPORT_RATE_1,
+            ACTIVE_MODE_TIMEOUT_0, ACTIVE_MODE_TIMEOUT_1,
+            IDLE_TOUCH_MODE_TIMEOUT_0, IDLE_TOUCH_MODE_TIMEOUT_1,
+            IDLE_MODE_TIMEOUT_0, IDLE_MODE_TIMEOUT_1,
+            LP1_MODE_TIMEOUT_0, LP1_MODE_TIMEOUT_1,
+            REATI_RETRY_TIME, REF_UPDATE_TIME,
+            I2C_TIMEOUT_0, I2C_TIMEOUT_1};
+
+        const uint8_t sys_alp_settings[] = {
+            SYSTEM_CONTROL_0, SYSTEM_CONTROL_1,
+            CONFIG_SETTINGS0, CONFIG_SETTINGS1,
+            OTHER_SETTINGS_0, OTHER_SETTINGS_1,
+            ALP_SETUP_0, ALP_SETUP_1,
+            ALP_TX_ENABLE_0, ALP_TX_ENABLE_1};
+
+                const uint8_t threshold_settings[] = {
+                        TRACKPAD_TOUCH_SET_THRESHOLD, TRACKPAD_TOUCH_CLEAR_THRESHOLD,
+                        ALP_THRESHOLD_0, ALP_THRESHOLD_1,
+                        ALP_SET_DEBOUNCE, ALP_CLEAR_DEBOUNCE};
+
+                const uint8_t lp_filter_settings[] = {
+                        ALP_COUNT_BETA_LP1, ALP_LTA_BETA_LP1,
+                        ALP_COUNT_BETA_LP2, ALP_LTA_BETA_LP2};
+
+                const uint8_t hardware_settings[] = {
+                        TP_CONVERSION_FREQUENCY_UP_PASS_LENGTH, TP_CONVERSION_FREQUENCY_FRACTION_VALUE,
+                        ALP_CONVERSION_FREQUENCY_UP_PASS_LENGTH, ALP_CONVERSION_FREQUENCY_FRACTION_VALUE,
+                        TRACKPAD_HARDWARE_SETTINGS_0, TRACKPAD_HARDWARE_SETTINGS_1,
+                        ALP_HARDWARE_SETTINGS_0, ALP_HARDWARE_SETTINGS_1};
+
+                const uint8_t trackpad_settings[] = {
+                        TRACKPAD_SETTINGS_0_0, TRACKPAD_SETTINGS_0_1,
+                        TRACKPAD_SETTINGS_1_0, TRACKPAD_SETTINGS_1_1,
+                        X_RESOLUTION_0, X_RESOLUTION_1,
+                        Y_RESOLUTION_0, Y_RESOLUTION_1,
+                        XY_DYNAMIC_FILTER_BOTTOM_SPEED_0, XY_DYNAMIC_FILTER_BOTTOM_SPEED_1,
+                        XY_DYNAMIC_FILTER_TOP_SPEED_0, XY_DYNAMIC_FILTER_TOP_SPEED_1,
+                        XY_DYNAMIC_FILTER_BOTTOM_BETA, XY_DYNAMIC_FILTER_STATIC_FILTER_BETA,
+                        STATIONARY_TOUCH_MOV_THRESHOLD, FINGER_SPLIT_FACTOR,
+                        X_TRIM_VALUE, Y_TRIM_VALUE};
+
+                const uint8_t settings_version[] = {
+                        MINOR_VERSION, MAJOR_VERSION};
+
+                const uint8_t gesture_settings[] = {
+                        GESTURE_ENABLE_0, GESTURE_ENABLE_1,
+                        TAP_TOUCH_TIME_0, TAP_TOUCH_TIME_1,
+                        TAP_WAIT_TIME_0, TAP_WAIT_TIME_1,
+                        TAP_DISTANCE_0, TAP_DISTANCE_1,
+                        HOLD_TIME_0, HOLD_TIME_1,
+                        SWIPE_TIME_0, SWIPE_TIME_1,
+                        SWIPE_X_DISTANCE_0, SWIPE_X_DISTANCE_1,
+                        SWIPE_Y_DISTANCE_0, SWIPE_Y_DISTANCE_1,
+                        SWIPE_X_CONS_DIST_0, SWIPE_X_CONS_DIST_1,
+                        SWIPE_Y_CONS_DIST_0, SWIPE_Y_CONS_DIST_1,
+                        SWIPE_ANGLE, PALM_THRESHOLD};
+
+                const uint8_t rx_tx_map_settings[] = {
+                        RX_TX_MAP_0, RX_TX_MAP_1,
+                        RX_TX_MAP_2, RX_TX_MAP_3,
+                        RX_TX_MAP_4, RX_TX_MAP_5,
+                        RX_TX_MAP_6, RX_TX_MAP_7,
+                        RX_TX_MAP_8, RX_TX_MAP_9,
+                        RX_TX_MAP_10, RX_TX_MAP_11,
+                        RX_TX_MAP_12, RX_TX_MAP_FILLER};
+
+                const uint8_t cycle_0_to_9_settings[] = {
+                        PLACEHOLDER_0, CH_1_CYCLE_0, CH_2_CYCLE_0,
+                        PLACEHOLDER_1, CH_1_CYCLE_1, CH_2_CYCLE_1,
+                        PLACEHOLDER_2, CH_1_CYCLE_2, CH_2_CYCLE_2,
+                        PLACEHOLDER_3, CH_1_CYCLE_3, CH_2_CYCLE_3,
+                        PLACEHOLDER_4, CH_1_CYCLE_4, CH_2_CYCLE_4,
+                        PLACEHOLDER_5, CH_1_CYCLE_5, CH_2_CYCLE_5,
+                        PLACEHOLDER_6, CH_1_CYCLE_6, CH_2_CYCLE_6,
+                        PLACEHOLDER_7, CH_1_CYCLE_7, CH_2_CYCLE_7,
+                        PLACEHOLDER_8, CH_1_CYCLE_8, CH_2_CYCLE_8,
+                        PLACEHOLDER_9, CH_1_CYCLE_9, CH_2_CYCLE_9};
+
+                const uint8_t cycle_10_to_19_settings[] = {
+                        PLACEHOLDER_10, CH_1_CYCLE_10, CH_2_CYCLE_10,
+                        PLACEHOLDER_11, CH_1_CYCLE_11, CH_2_CYCLE_11,
+                        PLACEHOLDER_12, CH_1_CYCLE_12, CH_2_CYCLE_12,
+                        PLACEHOLDER_13, CH_1_CYCLE_13, CH_2_CYCLE_13,
+                        PLACEHOLDER_14, CH_1_CYCLE_14, CH_2_CYCLE_14,
+                        PLACEHOLDER_15, CH_1_CYCLE_15, CH_2_CYCLE_15,
+                        PLACEHOLDER_16, CH_1_CYCLE_16, CH_2_CYCLE_16,
+                        PLACEHOLDER_17, CH_1_CYCLE_17, CH_2_CYCLE_17,
+                        PLACEHOLDER_18, CH_1_CYCLE_18, CH_2_CYCLE_18,
+                        PLACEHOLDER_19, CH_1_CYCLE_19, CH_2_CYCLE_19};
+
+                const uint8_t cycle_20_settings[] = {
+                        PLACEHOLDER_20, CH_1_CYCLE_20, CH_2_CYCLE_20};
+
+        if (!trackpad_write_block_retry(IQS7211E_MM_ALP_ATI_COMP_A, alp_ati_comp, sizeof(alp_ati_comp), "ALP_ATI_COMP"))
+        {
+                LOG_ERR("Trackpad config block failed: ALP/ATI compensation");
                 return false;
         }
-        k_sleep(K_MSEC(250)); // Wait for reset
-        LOG_INF("Software reset complete");
 
-        // 3. Write settings using C macro (not C++ lambda)
-        LOG_INF("Writing settings in Arduino order...");
+        if (!trackpad_write_block_retry(IQS7211E_MM_TP_GLOBAL_MIRRORS, ati_settings, sizeof(ati_settings), "ATI_SETTINGS"))
+        {
+                LOG_ERR("Trackpad config block failed: ATI settings");
+                return false;
+        }
 
-// Helper macro for single writes with Arduino-like error handling
-#define WRITE_SINGLE(addr, value, desc)                                                                  \
-        do                                                                                               \
-        {                                                                                                \
-                uint8_t cmd[] = {addr, value};                                                           \
-                int result = i2c_write(i2c_dev, cmd, 2, 0x56);                                           \
-                if (result != 0)                                                                         \
-                {                                                                                        \
-                        LOG_ERR("Failed to write %s (0x%02X to 0x%02X): %d", desc, value, addr, result); \
-                        return false;                                                                    \
-                }                                                                                        \
-                k_sleep(K_MSEC(10));                                                                     \
-        } while (0)
+        if (!trackpad_write_block_retry(IQS7211E_MM_ACTIVE_MODE_RR, rr_timing, sizeof(rr_timing), "RR_TIMING"))
+        {
+                LOG_ERR("Trackpad config block failed: report-rates/timing");
+                return false;
+        }
 
-        // WRITE IN EXACT ARDUINO ORDER
+        if (!trackpad_write_block_retry(IQS7211E_MM_SYS_CONTROL, sys_alp_settings, sizeof(sys_alp_settings), "SYS_ALP"))
+        {
+                LOG_ERR("Trackpad config block failed: system/alp settings");
+                return false;
+        }
 
-        // 1. ALP Compensation (0x1F-0x22)
-        WRITE_SINGLE(0x1F, ALP_COMPENSATION_A_0, "ALP_COMP_A0");
-        WRITE_SINGLE(0x20, ALP_COMPENSATION_A_1, "ALP_COMP_A1");
-        WRITE_SINGLE(0x21, ALP_COMPENSATION_B_0, "ALP_COMP_B0");
-        WRITE_SINGLE(0x22, ALP_COMPENSATION_B_1, "ALP_COMP_B1");
-        k_sleep(K_MSEC(50));
+        if (!trackpad_write_block_retry(IQS7211E_MM_TP_TOUCH_SET_CLEAR_THR, threshold_settings, sizeof(threshold_settings), "THRESHOLDS"))
+        {
+                LOG_ERR("Trackpad config block failed: thresholds");
+                return false;
+        }
 
-        // 2. ATI Settings (0x23-0x30)
-        WRITE_SINGLE(0x23, TP_ATI_MULTIPLIERS_DIVIDERS_0, "TP_ATI_MUL_DIV_0");
-        WRITE_SINGLE(0x24, TP_ATI_MULTIPLIERS_DIVIDERS_1, "TP_ATI_MUL_DIV_1");
-        WRITE_SINGLE(0x25, TP_COMPENSATION_DIV, "TP_COMP_DIV");
-        WRITE_SINGLE(0x26, TP_REF_DRIFT_LIMIT, "TP_REF_DRIFT");
-        WRITE_SINGLE(0x27, TP_ATI_TARGET_0, "TP_ATI_TARGET_0");
-        WRITE_SINGLE(0x28, TP_ATI_TARGET_1, "TP_ATI_TARGET_1");
-        WRITE_SINGLE(0x29, TP_MIN_COUNT_REATI_0, "TP_MIN_COUNT_0");
-        WRITE_SINGLE(0x2A, TP_MIN_COUNT_REATI_1, "TP_MIN_COUNT_1");
-        WRITE_SINGLE(0x2B, ALP_ATI_MULTIPLIERS_DIVIDERS_0, "ALP_ATI_MUL_0");
-        WRITE_SINGLE(0x2C, ALP_ATI_MULTIPLIERS_DIVIDERS_1, "ALP_ATI_MUL_1");
-        WRITE_SINGLE(0x2D, ALP_COMPENSATION_DIV, "ALP_COMP_DIV");
-        WRITE_SINGLE(0x2E, ALP_LTA_DRIFT_LIMIT, "ALP_LTA_DRIFT");
-        WRITE_SINGLE(0x2F, ALP_ATI_TARGET_0, "ALP_ATI_TARGET_0");
-        WRITE_SINGLE(0x30, ALP_ATI_TARGET_1, "ALP_ATI_TARGET_1");
-        k_sleep(K_MSEC(100));
+        if (!trackpad_write_block_retry(IQS7211E_MM_LP1_FILTERS, lp_filter_settings, sizeof(lp_filter_settings), "LP_FILTERS"))
+        {
+                LOG_ERR("Trackpad config block failed: LP filters");
+                return false;
+        }
 
-        // 3. Report Rates (0x31-0x46)
-        WRITE_SINGLE(0x31, ACTIVE_MODE_REPORT_RATE_0, "ACTIVE_RR_0");
-        WRITE_SINGLE(0x32, ACTIVE_MODE_REPORT_RATE_1, "ACTIVE_RR_1");
-        WRITE_SINGLE(0x33, IDLE_TOUCH_MODE_REPORT_RATE_0, "IDLE_TOUCH_RR_0");
-        WRITE_SINGLE(0x34, IDLE_TOUCH_MODE_REPORT_RATE_1, "IDLE_TOUCH_RR_1");
-        WRITE_SINGLE(0x35, IDLE_MODE_REPORT_RATE_0, "IDLE_RR_0");
-        WRITE_SINGLE(0x36, IDLE_MODE_REPORT_RATE_1, "IDLE_RR_1");
-        WRITE_SINGLE(0x37, LP1_MODE_REPORT_RATE_0, "LP1_RR_0");
-        WRITE_SINGLE(0x38, LP1_MODE_REPORT_RATE_1, "LP1_RR_1");
-        WRITE_SINGLE(0x39, LP2_MODE_REPORT_RATE_0, "LP2_RR_0");
-        WRITE_SINGLE(0x3A, LP2_MODE_REPORT_RATE_1, "LP2_RR_1");
-        WRITE_SINGLE(0x3B, ACTIVE_MODE_TIMEOUT_0, "ACTIVE_TO_0");
-        WRITE_SINGLE(0x3C, ACTIVE_MODE_TIMEOUT_1, "ACTIVE_TO_1");
-        WRITE_SINGLE(0x3D, IDLE_TOUCH_MODE_TIMEOUT_0, "IDLE_TOUCH_TO_0");
-        WRITE_SINGLE(0x3E, IDLE_TOUCH_MODE_TIMEOUT_1, "IDLE_TOUCH_TO_1");
-        WRITE_SINGLE(0x3F, IDLE_MODE_TIMEOUT_0, "IDLE_TO_0");
-        WRITE_SINGLE(0x40, IDLE_MODE_TIMEOUT_1, "IDLE_TO_1");
-        WRITE_SINGLE(0x41, LP1_MODE_TIMEOUT_0, "LP1_TO_0");
-        WRITE_SINGLE(0x42, LP1_MODE_TIMEOUT_1, "LP1_TO_1");
-        WRITE_SINGLE(0x43, REATI_RETRY_TIME, "REATI_RETRY");
-        WRITE_SINGLE(0x44, REF_UPDATE_TIME, "REF_UPDATE");
-        WRITE_SINGLE(0x45, I2C_TIMEOUT_0, "I2C_TO_0");
-        WRITE_SINGLE(0x46, I2C_TIMEOUT_1, "I2C_TO_1");
-        k_sleep(K_MSEC(100));
+        if (!trackpad_write_block_retry(IQS7211E_MM_TP_CONV_FREQ, hardware_settings, sizeof(hardware_settings), "HARDWARE"))
+        {
+                LOG_ERR("Trackpad config block failed: hardware settings");
+                return false;
+        }
 
-        // 4. System Control Settings (0x50-0x55) - THE CRITICAL ONES
-        LOG_INF("Writing CRITICAL system control settings...");
-        WRITE_SINGLE(0x50, SYSTEM_CONTROL_0, "SYS_CTRL_0");
-        WRITE_SINGLE(0x51, SYSTEM_CONTROL_1, "SYS_CTRL_1");
-        WRITE_SINGLE(0x52, CONFIG_SETTINGS0, "CONFIG_0");
-        WRITE_SINGLE(0x53, CONFIG_SETTINGS1, "CONFIG_1");
-        WRITE_SINGLE(0x54, OTHER_SETTINGS_0, "OTHER_0");
-        WRITE_SINGLE(0x55, OTHER_SETTINGS_1, "OTHER_1");
-        k_sleep(K_MSEC(100));
+        if (!trackpad_write_block_retry(IQS7211E_MM_TP_RX_SETTINGS, trackpad_settings, sizeof(trackpad_settings), "TP_SETTINGS"))
+        {
+                LOG_ERR("Trackpad config block failed: trackpad settings");
+                return false;
+        }
 
-        // 6. Acknowledge reset (CORRECT address)
-        LOG_INF("Acknowledging reset...");
-        WRITE_SINGLE(0x50, SYSTEM_CONTROL_0 | 0x80, "ACK_RESET");
-        k_sleep(K_MSEC(100));
+        if (!trackpad_write_block_retry(IQS7211E_MM_SETTINGS_VERSION, settings_version, sizeof(settings_version), "SETTINGS_VERSION"))
+        {
+                LOG_ERR("Trackpad config block failed: settings version");
+                return false;
+        }
 
-        // 7. Start ATI (CORRECT address)
-        LOG_INF("Starting ATI...");
-        WRITE_SINGLE(0x50, SYSTEM_CONTROL_0 | 0x20, "START_ATI");
-        k_sleep(K_MSEC(100));
+        if (!trackpad_write_block_retry(IQS7211E_MM_GESTURE_ENABLE, gesture_settings, sizeof(gesture_settings), "GESTURES"))
+        {
+                LOG_ERR("Trackpad config block failed: gesture settings");
+                return false;
+        }
 
-        // 8. Wait for ATI with proper polling
-        LOG_INF("Waiting for ATI completion...");
-        uint32_t ati_start = k_uptime_get_32();
+        if (!trackpad_write_block_retry(IQS7211E_MM_RX_TX_MAPPING_0_1, rx_tx_map_settings, sizeof(rx_tx_map_settings), "RX_TX_MAP"))
+        {
+                LOG_ERR("Trackpad config block failed: rx/tx map");
+                return false;
+        }
+
+        if (!trackpad_write_block_retry(IQS7211E_MM_PROXA_CYCLE0, cycle_0_to_9_settings, sizeof(cycle_0_to_9_settings), "CYCLES_0_9"))
+        {
+                LOG_ERR("Trackpad config block failed: cycles 0-9");
+                return false;
+        }
+
+        if (!trackpad_write_block_retry(IQS7211E_MM_PROXA_CYCLE10, cycle_10_to_19_settings, sizeof(cycle_10_to_19_settings), "CYCLES_10_19"))
+        {
+                LOG_ERR("Trackpad config block failed: cycles 10-19");
+                return false;
+        }
+
+        if (!trackpad_write_block_retry(IQS7211E_MM_PROXA_CYCLE20, cycle_20_settings, sizeof(cycle_20_settings), "CYCLE_20"))
+        {
+                LOG_ERR("Trackpad config block failed: cycle 20");
+                return false;
+        }
+
+        LOG_INF("Trackpad config blocks written (15 blocks)");
+
+        // Clear Show Reset before event/stream mode behavior is valid
+        if (!trackpad_update_sys_control_bits(0x80, 0x00, 0x00, 0x00, "ACK_RESET"))
+        {
+                LOG_ERR("Trackpad ACK_RESET failed");
+                return false;
+        }
+
+        // Start RE-ATI and wait for completion indication
+        if (!trackpad_update_sys_control_bits(0x20, 0x00, 0x00, 0x00, "START_ATI"))
+        {
+                LOG_ERR("Trackpad START_ATI failed");
+                return false;
+        }
+
         bool ati_done = false;
+        uint32_t ati_start = k_uptime_get_32();
+        uint32_t ati_last_log = ati_start;
+        while ((k_uptime_get_32() - ati_start) < 7000)
+        {
+                (void)trackpad_wait_rdy_low(60);
 
-        while ((k_uptime_get_32() - ati_start) < 3000)
-        { // 3 second timeout (reduced from 10s to prevent long freezes)
-                uint8_t info_flags[2];
-                ret = i2c_write_read(i2c_dev, 0x56, "\x0F", 1, info_flags, 2);
-                if (ret == 0)
+                uint8_t info_flags[2] = {0};
+                uint8_t info_reg = IQS7211E_MM_INFO_FLAGS;
+                int info_ret = i2c_write_read(i2c_dev, 0x56, &info_reg, 1, info_flags, 2);
+                uint32_t now = k_uptime_get_32();
+
+                if ((now - ati_last_log) >= 1000)
                 {
-                        if (info_flags[0] & 0x10)
-                        { // ATI_OCCURRED_BIT
-                                LOG_INF("ATI completed successfully!");
-                                ati_done = true;
-                                break;
-                        }
+                        int rdy_state = trackpad_rdy_read_raw();
+                        LOG_DBG("ATI wait: t=%ums ret=%d flags=0x%02X 0x%02X rdy=%d",
+                                (unsigned int)(now - ati_start),
+                                info_ret,
+                                info_flags[0],
+                                info_flags[1],
+                                rdy_state);
+                        ati_last_log = now;
                 }
-                k_sleep(K_MSEC(200));
+
+                if (info_ret == 0 && (info_flags[0] & 0x10))
+                {
+                        LOG_INF("ATI complete: t=%ums flags=0x%02X 0x%02X",
+                                (unsigned int)(now - ati_start), info_flags[0], info_flags[1]);
+                        ati_done = true;
+                        break;
+                }
+
+                k_sleep(K_MSEC(25));
         }
 
         if (!ati_done)
         {
-                LOG_WRN("ATI timeout, but continuing anyway");
+                LOG_ERR("Trackpad ATI did not complete in time");
+                return false;
         }
 
-        // 9. Set STREAMING mode instead of event mode for continuous data
-        LOG_INF("Setting streaming mode (disable event mode)...");
-        WRITE_SINGLE(0x53, CONFIG_SETTINGS1 & ~0x01, "STREAMING_MODE"); // Clear EVENT_MODE_BIT
-        k_sleep(K_MSEC(100));
+        // Keep streaming mode enabled by clearing EVENT bit in SYS_CONTROL[1]
+        uint8_t sys_ctrl_bytes[2] = {0};
+        uint8_t sys_ctrl_reg = IQS7211E_MM_SYS_CONTROL;
+        int sys_ctrl_ret = i2c_write_read(i2c_dev, 0x56, &sys_ctrl_reg, 1, sys_ctrl_bytes, 2);
+        if (sys_ctrl_ret != 0)
+        {
+                LOG_ERR("Trackpad stream-mode readback failed: %d", sys_ctrl_ret);
+                return false;
+        }
 
-#undef WRITE_SINGLE
+        sys_ctrl_bytes[1] &= (uint8_t)~0x01;
+        if (!trackpad_update_sys_control_bits(0x00, 0x00, 0x00, 0x01, "STREAM_MODE_SYSCTRL"))
+        {
+                LOG_ERR("Trackpad STREAM_MODE_SYSCTRL write failed");
+                return false;
+        }
 
-        LOG_INF("=== ARDUINO-STYLE TRACKPAD INIT COMPLETE ===");
+        uint8_t sys_ctrl_readback[2] = {0};
+        int sys_ctrl_rb_ret = i2c_write_read(i2c_dev, 0x56, &sys_ctrl_reg, 1, sys_ctrl_readback, 2);
+        LOG_INF("Trackpad SYS_CONTROL readback: ret=%d [0]=0x%02X [1]=0x%02X",
+                sys_ctrl_rb_ret,
+                sys_ctrl_readback[0],
+                sys_ctrl_readback[1]);
+
+        LOG_INF("=== TRACKPAD INIT COMPLETE (STREAMING + POLLING) ===");
         return true;
 }
 
@@ -895,6 +1319,11 @@ void trackpad_rdy_interrupt_handler(const struct device *dev, struct gpio_callba
 // Add this function to trigger haptic via GPIO pin
 void check_trackpad_haptic_feedback(uint16_t new_x, uint16_t new_y)
 {
+        if (trackpad_init_in_progress || !trackpad_init_complete)
+        {
+                return;
+        }
+
         static uint16_t last_x = 0;
         static uint16_t last_y = 0;
         static bool first_read = true;
@@ -947,15 +1376,61 @@ void trackpad_thread_entry(void *p1, void *p2, void *p3)
         ARG_UNUSED(p2);
         ARG_UNUSED(p3);
 
-        // Wait for system to boot up and I2C to stabilize
-        k_sleep(K_MSEC(500));  // Reduced from 3000ms to 500ms - I2C is ready much faster
+        trackpad_thread_heartbeat = k_uptime_get_32();
 
-        // Use Arduino library for initialization
-        if (!init_trackpad_arduino_hybrid())
+        // Wait for system to boot up and I2C to stabilize
+        k_sleep(K_MSEC(200));
+
+        trackpad_init_in_progress = true;
+        trackpad_init_complete = false;
+
+        bool trackpad_ok = false;
+        for (int attempt = 1; attempt <= 3; attempt++)
         {
-                LOG_ERR("Arduino hybrid trackpad init failed");
+                trackpad_thread_heartbeat = k_uptime_get_32();
+                LOG_INF("Trackpad init attempt %d/3 starting", attempt);
+
+                if (attempt > 1)
+                {
+                        LOG_WRN("Retrying trackpad init (attempt %d/3)", attempt);
+                        k_sleep(K_MSEC(120));
+                        trackpad_thread_heartbeat = k_uptime_get_32();
+                }
+
+                if (init_trackpad_enhanced())
+                {
+                        LOG_INF("Trackpad init attempt %d/3 succeeded", attempt);
+                        trackpad_ok = true;
+                        break;
+                }
+
+                LOG_WRN("Trackpad init attempt %d/3 failed", attempt);
+        }
+
+        if (!trackpad_ok)
+        {
+                LOG_ERR("Trackpad deterministic init failed after retries");
+                trackpad_init_in_progress = false;
+                trackpad_thread_heartbeat = k_uptime_get_32();
                 return;
         }
+
+        // Let trackpad settle before allowing shared haptic motor activity
+        k_sleep(K_MSEC(120));
+
+        {
+                uint16_t x = 0;
+                uint16_t y = 0;
+                bool first_read_ok = read_trackpad_coordinates_simple(&x, &y);
+                LOG_INF("Trackpad post-init first read: ok=%d x=%u y=%u", first_read_ok, x, y);
+        }
+
+        trackpad_init_complete = true;
+        trackpad_init_in_progress = false;
+
+        // Keep STREAMING mode but use polling reads (no RDY interrupt-driven path)
+        LOG_INF("Trackpad using STREAMING + POLLING mode (interrupts disabled by design)");
+        goto polling_mode;
 
         // Configure RDY pin for interrupt-based reading
         if (!gpio_is_ready_dt(&trackpad_rdy))
@@ -983,16 +1458,20 @@ void trackpad_thread_entry(void *p1, void *p2, void *p3)
                 goto polling_mode;
         }
 
-        // Enable interrupt - Use EDGE_RISING for streaming mode (RDY pulses HIGH when data ready)
-        LOG_INF("Configuring RISING EDGE interrupt for streaming mode...");
-        ret = gpio_pin_interrupt_configure_dt(&trackpad_rdy, GPIO_INT_EDGE_RISING);
+        // Drain any stale sem signals before enabling interrupts
+        while (k_sem_take(&trackpad_rdy_sem, K_NO_WAIT) == 0) {
+        }
+
+        // RDY is active LOW/open-drain, so trigger on active edge
+        LOG_INF("Configuring ACTIVE EDGE interrupt for RDY (active LOW)...");
+        ret = gpio_pin_interrupt_configure_dt(&trackpad_rdy, GPIO_INT_EDGE_TO_ACTIVE);
         if (ret != 0)
         {
                 LOG_ERR("Failed to configure RDY interrupt: %d", ret);
                 goto polling_mode;
         }
 
-        LOG_INF("RDY pin interrupt configured - streaming mode active (continuous data)");
+        LOG_INF("RDY pin interrupt configured - active-low sync enabled");
 
         // Interrupt-based reading loop
         while (1)
@@ -1052,6 +1531,13 @@ void trackpad_thread_entry(void *p1, void *p2, void *p3)
 polling_mode:
         LOG_INF("Starting polling mode coordinate reading...");
 
+        uint32_t poll_last_log = k_uptime_get_32();
+        uint32_t poll_ok = 0;
+        uint32_t poll_invalid = 0;
+        uint32_t poll_fail = 0;
+        uint16_t poll_last_x = 0;
+        uint16_t poll_last_y = 0;
+
         // Fallback to polling mode if interrupt setup failed
         while (1)
         {
@@ -1065,9 +1551,12 @@ polling_mode:
 
                 if (read_trackpad_coordinates_simple(&x, &y))
                 {
-                        // Check for valid coordinates
-                        if (x != 0xFFFF && y != 0xFFFF && (x != 0 || y != 0))
+                        if (trackpad_coordinates_are_valid(x, y))
                         {
+                                poll_ok++;
+                                poll_last_x = x;
+                                poll_last_y = y;
+
                                 // Check for haptic feedback before updating controller data
                                 check_trackpad_haptic_feedback(x, y);
 
@@ -1076,18 +1565,34 @@ polling_mode:
                         }
                         else
                         {
+                                poll_invalid++;
                                 controller_data.padX = 0;
                                 controller_data.padY = 0;
                         }
                 }
                 else
                 {
-                        // I2C read failed - set coordinates to 0
+                        poll_fail++;
                         controller_data.padX = 0;
                         controller_data.padY = 0;
                 }
 
-                k_sleep(K_MSEC(11)); // 60Hz polling - thread will be scheduled properly
+                uint32_t now = k_uptime_get_32();
+                if ((now - poll_last_log) >= 1000)
+                {
+                        LOG_INF("Trackpad poll stats: ok=%u invalid=%u fail=%u last=(%u,%u)",
+                                (unsigned int)poll_ok,
+                                (unsigned int)poll_invalid,
+                                (unsigned int)poll_fail,
+                                poll_last_x,
+                                poll_last_y);
+                        poll_ok = 0;
+                        poll_invalid = 0;
+                        poll_fail = 0;
+                        poll_last_log = now;
+                }
+
+                k_sleep(K_MSEC(6));
         }
 }
 
@@ -1100,6 +1605,35 @@ void display_thread_entry(void *p1, void *p2, void *p3)
 
         // Wait for system to boot up
         k_sleep(K_MSEC(500));
+
+        // Avoid I2C contention while trackpad is running deterministic init at boot.
+        // Give trackpad thread a short window to enter init first.
+        uint32_t arm_start = k_uptime_get_32();
+        while (!trackpad_init_in_progress && !trackpad_init_complete &&
+               (k_uptime_get_32() - arm_start) < 600)
+        {
+                k_sleep(K_MSEC(10));
+        }
+
+        if (trackpad_init_in_progress)
+        {
+                LOG_INF("Display thread waiting for trackpad init to finish");
+                uint32_t wait_start = k_uptime_get_32();
+                while (trackpad_init_in_progress && (k_uptime_get_32() - wait_start) < 10000)
+                {
+                        display_thread_heartbeat = k_uptime_get_32();
+                        k_sleep(K_MSEC(50));
+                }
+
+                if (trackpad_init_in_progress)
+                {
+                        LOG_WRN("Display thread timeout waiting for trackpad init; continuing");
+                }
+                else
+                {
+                        LOG_INF("Display thread resuming after trackpad init");
+                }
+        }
 
         while (1)
         {
@@ -1378,6 +1912,19 @@ void calibrate_analog_inputs(void)
 // Read IMU sensor data using imu_driver library
 void read_imu_inputs(void)
 {
+        // Avoid competing for shared I2C bus while trackpad init/config writes are in progress.
+        if (trackpad_init_in_progress)
+        {
+                static uint32_t last_log = 0;
+                uint32_t now = k_uptime_get_32();
+                if ((now - last_log) > 2000)
+                {
+                        LOG_INF("Skipping IMU read while trackpad init is active");
+                        last_log = now;
+                }
+                return;
+        }
+
         // First read raw data to ensure filter is initialized
         imu_raw_data_t raw_data;
         int raw_ret = imu_read_raw_data(&raw_data);
@@ -1852,15 +2399,6 @@ int main(void)
                 {
                         LOG_WRN("Haptic external trigger setup failed: %d", ret);
                 }
-                else
-                {
-                        // Test haptic motor with a quick pulse to verify it's working
-                        k_sleep(K_MSEC(50));
-                        gpio_pin_set_dt(&haptic_trigger, 1);
-                        k_sleep(K_MSEC(50));
-                        gpio_pin_set_dt(&haptic_trigger, 0);
-                        LOG_INF("Haptic motor test pulse sent");
-                }
         }
 
         // Initialize power management (with combos disabled for now)
@@ -2026,8 +2564,7 @@ int main(void)
 
         LOG_INF("Controller ready - starting continuous transmission with ACK timing");
 
-        // Note: Trackpad will be initialized directly in read_trackpad_inputs() for simplicity
-        LOG_INF("Trackpad will be initialized on first read attempt");
+        LOG_INF("Trackpad will initialize at boot in trackpad thread");
 
         // Report peripheral status after boot
         LOG_INF("=== PERIPHERAL STATUS REPORT ===");
@@ -2036,7 +2573,7 @@ int main(void)
         LOG_INF("Button driver: %s", button_driver_is_initialized() ? "AVAILABLE" : "NOT AVAILABLE");
         LOG_INF("Analog driver: %s", analog_driver_is_initialized() ? "AVAILABLE" : "NOT AVAILABLE");
         LOG_INF("Display: %s", (display_get_status() == DISPLAY_STATUS_READY) ? "AVAILABLE" : "NOT AVAILABLE"); // Check actual status
-        LOG_INF("Trackpad: Will be initialized on first touch");
+        LOG_INF("Trackpad: Boot-time initialization enabled");
 
         update_controller_data();
 
@@ -2614,9 +3151,11 @@ int main(void)
                                 LOG_INF("TX Debug: %u attempts, status: %d, trigger: %d, sticks: %d,%d, errors: %u",
                                         tx_attempt_counter, tx_status, controller_data.trigger,
                                         controller_data.stickX, controller_data.stickY, consecutive_errors);
+
+                                double esb_success_rate_pct = (double)esb_stats.success_rate * 100.0;
                                 LOG_INF("ESB Stats: total: %u, success: %u, failed: %u, rate: %.1f%%, last_ok: %s",
                                         esb_stats.total_transmissions, esb_stats.successful_transmissions,
-                                        esb_stats.failed_transmissions, esb_stats.success_rate * 100.0f,
+                                        esb_stats.failed_transmissions, esb_success_rate_pct,
                                         esb_stats.last_tx_succeeded ? "yes" : "no");
 
                                 // Check for data corruption - log full controller data structure

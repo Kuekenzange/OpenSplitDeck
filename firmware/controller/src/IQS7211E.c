@@ -106,6 +106,9 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
   uint16_t prod_num;
   uint8_t ver_maj, ver_min;
 
+  // Keep RDY state fresh for every init-state pass (active LOW communication window)
+  iqs7211e_getRDYStatus(instance);
+
   switch (instance->iqs7211e_state.init_state)
   {
     /* Verifies product number to determine if the correct device is connected  
@@ -145,10 +148,9 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
 
     /* Verify if a reset has occurred */
     case IQS7211E_INIT_READ_RESET:
-      // Force settings write during initial configuration - don't wait for RDY
-      if(iqs7211e_deviceRDY || instance->iqs7211e_state.state == IQS7211E_STATE_INIT)
+      if(iqs7211e_deviceRDY)
       {
-        LOG_INF("\tIQS7211E_INIT_READ_RESET (forcing for initial config)");
+        LOG_INF("\tIQS7211E_INIT_READ_RESET");
         iqs7211e_updateInfoFlags(instance, RESTART);
         if (iqs7211e_checkReset(instance, STOP))
         {
@@ -165,10 +167,9 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
 
     /* Perform SW Reset */
     case IQS7211E_INIT_CHIP_RESET:
-      // Force chip reset during initial configuration - don't wait for RDY
-      if(iqs7211e_deviceRDY || instance->iqs7211e_state.state == IQS7211E_STATE_INIT)
+      if(iqs7211e_deviceRDY)
       {
-        LOG_INF("\tIQS7211E_INIT_CHIP_RESET (forcing for initial config)");
+        LOG_INF("\tIQS7211E_INIT_CHIP_RESET");
 
         //Perform SW Reset
         iqs7211e_SW_Reset(instance, STOP);
@@ -180,10 +181,9 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
 
     /* Write all settings to IQS7211E from .h file */
     case IQS7211E_INIT_UPDATE_SETTINGS:
-      // Force settings write during initial configuration - don't wait for RDY
-      if(iqs7211e_deviceRDY || instance->iqs7211e_state.state == IQS7211E_STATE_INIT)
+      if(iqs7211e_deviceRDY)
       {
-        LOG_INF("\tIQS7211E_INIT_UPDATE_SETTINGS (forcing for initial config)");
+        LOG_INF("\tIQS7211E_INIT_UPDATE_SETTINGS");
         iqs7211e_writeMM(instance, RESTART);
         instance->iqs7211e_state.init_state = IQS7211E_INIT_ACK_RESET;
       }
@@ -191,10 +191,9 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
 
     /* Acknowledge that the device went through a reset */
     case IQS7211E_INIT_ACK_RESET:
-      // Force reset acknowledgment during initial configuration - don't wait for RDY
-      if(iqs7211e_deviceRDY || instance->iqs7211e_state.state == IQS7211E_STATE_INIT)
+      if(iqs7211e_deviceRDY)
       {
-        LOG_INF("\tIQS7211E_INIT_ACK_RESET (forcing for initial config)");
+        LOG_INF("\tIQS7211E_INIT_ACK_RESET");
         iqs7211e_acknowledgeReset(instance, STOP);
         instance->iqs7211e_state.init_state = IQS7211E_INIT_ATI;
       }
@@ -203,10 +202,9 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
     /* Run the ATI algorithm to recalibrate the device with the newly added 
     settings */
     case IQS7211E_INIT_ATI:
-      // Force ATI during initial configuration - don't wait for RDY
-      if(iqs7211e_deviceRDY || instance->iqs7211e_state.state == IQS7211E_STATE_INIT)
+      if(iqs7211e_deviceRDY)
       {
-        LOG_INF("\tIQS7211E_INIT_ATI (forcing for initial config)");
+        LOG_INF("\tIQS7211E_INIT_ATI");
         iqs7211e_ReATI(instance, STOP);
         instance->iqs7211e_state.init_state = IQS7211E_INIT_WAIT_FOR_ATI;
         LOG_INF("\tIQS7211E_INIT_WAIT_FOR_ATI");
@@ -215,8 +213,8 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
 
     /* Read the ATI Active bit to see if the rest of the program can continue */
     case IQS7211E_INIT_WAIT_FOR_ATI:
-      // Exact Arduino implementation with optional timeout for raw data reading
       static uint32_t ati_start_time = 0;
+      static uint8_t ati_retry_count = 0;
       
       // Initialize timeout on first entry
       if (ati_start_time == 0) {
@@ -225,44 +223,60 @@ bool iqs7211e_init(iqs7211e_instance_t *instance)
       
       if(iqs7211e_deviceRDY)
       {
-        if(!iqs7211e_readATIactive(instance))
+        // RE-ATI occurred/completed indication from info flags
+        if(iqs7211e_readATIactive(instance))
         {
           LOG_INF("\t\tATI DONE - Initialization Complete!");
+          ati_start_time = 0;
+          ati_retry_count = 0;
           instance->iqs7211e_state.init_state = IQS7211E_INIT_READ_DATA;
         }
       }
       
-      // Timeout after 20 seconds for raw data reading (less aggressive than before)
       uint32_t elapsed = k_uptime_get_32() - ati_start_time;
-      if (elapsed > 2000) {
-        LOG_WRN("\t\tATI TIMEOUT (2s) - Proceeding with raw data reading");
-        LOG_WRN("\t\tNote: ATI may still be running, but device should be functional");
-        instance->iqs7211e_state.init_state = IQS7211E_INIT_READ_DATA;
+      if (elapsed > 5000) {
+        if (ati_retry_count < 1) {
+          LOG_WRN("\t\tATI TIMEOUT (5s) - retrying RE-ATI once");
+          ati_retry_count++;
+          ati_start_time = k_uptime_get_32();
+          instance->iqs7211e_state.init_state = IQS7211E_INIT_ATI;
+        } else {
+          LOG_WRN("\t\tATI TIMEOUT after retry - proceeding with caution");
+          ati_start_time = 0;
+          ati_retry_count = 0;
+          instance->iqs7211e_state.init_state = IQS7211E_INIT_READ_DATA;
+        }
       }
     break;
 
     /* Read the latest data from the iqs7211e */
     case IQS7211E_INIT_READ_DATA:
-      // Force initial data read to complete initialization - don't wait for RDY yet
-      LOG_INF("\tIQS7211E_INIT_READ_DATA (forcing for initial config)");
-      iqs7211e_queueValueUpdates(instance);
-      instance->iqs7211e_state.init_state = IQS7211E_INIT_ACTIVATE_STREAM_MODE;
+      if(iqs7211e_deviceRDY)
+      {
+        LOG_INF("\tIQS7211E_INIT_READ_DATA");
+        iqs7211e_queueValueUpdates(instance);
+        instance->iqs7211e_state.init_state = IQS7211E_INIT_ACTIVATE_STREAM_MODE;
+      }
     break;
 
     /* Turn on I2C Event mode */
     case IQS7211E_INIT_ACTIVATE_EVENT_MODE:
-      // Force event mode activation to complete initialization - don't wait for RDY yet
-      LOG_INF("\tIQS7211E_INIT_ACTIVATE_EVENT_MODE (forcing for initial config)");
-      iqs7211e_setEventMode(instance, STOP);
-      instance->iqs7211e_state.init_state = IQS7211E_INIT_DONE;
+      if(iqs7211e_deviceRDY)
+      {
+        LOG_INF("\tIQS7211E_INIT_ACTIVATE_EVENT_MODE");
+        iqs7211e_setEventMode(instance, STOP);
+        instance->iqs7211e_state.init_state = IQS7211E_INIT_DONE;
+      }
     break;
 
     /* Turn on I2C Stream mode */
     case IQS7211E_INIT_ACTIVATE_STREAM_MODE:
-      // Force stream mode activation to complete initialization
-      LOG_INF("\tIQS7211E_INIT_ACTIVATE_STREAM_MODE (forcing for initial config)");
-      iqs7211e_setStreamMode(instance, STOP);
-      instance->iqs7211e_state.init_state = IQS7211E_INIT_DONE;
+      if(iqs7211e_deviceRDY)
+      {
+        LOG_INF("\tIQS7211E_INIT_ACTIVATE_STREAM_MODE");
+        iqs7211e_setStreamMode(instance, STOP);
+        instance->iqs7211e_state.init_state = IQS7211E_INIT_DONE;
+      }
     break;
 
     /* If all operations have been completed correctly, the RDY pin can be set
@@ -378,8 +392,8 @@ static void iqs7211e_ready_interrupt(const struct device *dev, struct gpio_callb
         .dt_flags = GPIO_ACTIVE_LOW
     };
     
-    // Read pin state - if LOW (0), device is ready
-    int pin_state = gpio_pin_get_dt(&ready_pin);
+    // Read RAW pin state (active-low line): LOW(0) means device is ready
+    int pin_state = gpio_pin_get(ready_pin.port, ready_pin.pin);
     iqs7211e_deviceRDY = (pin_state == 0);  // Active LOW means 0 = ready
     
     // Simple debug (minimal logging in ISR)
@@ -410,7 +424,7 @@ bool iqs7211e_getRDYStatus(iqs7211e_instance_t *instance)
 {
   // Read the GPIO pin state directly (polling mode - no interrupt)
   if (ready_pin_spec.port != NULL) {
-    int pin_state = gpio_pin_get_dt(&ready_pin_spec);
+    int pin_state = gpio_pin_get(ready_pin_spec.port, ready_pin_spec.pin);
     if (pin_state >= 0) {
       // Update the global state variable based on actual pin reading
       iqs7211e_deviceRDY = (pin_state == 0);  // Active LOW means 0 = ready
